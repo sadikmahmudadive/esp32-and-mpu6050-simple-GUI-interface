@@ -1,21 +1,4 @@
-from ursina import *
-import serial
-import threading
-import sys
 
-# --- Ursina App Setup ---
-app = Ursina()
-
-# Define the 3D model for our sensor
-# We use a 'cube' model and scale it to look like a boardhttps://github.com/sadikmahmudadive/esp32-and-mpu6050-simple-GUI-interface
-board = Entity(model='cube', scale=(3, 0.5, 1.5), color=color.azure)
-# Add a red "pointer" to see the "front" of the board
-pointer = Entity(model='cube', parent=board, scale=(0.1, 0.2, 0.5), position=(0, 0, 0.5), color=color.red)
-
-# Set up the camera
-EditorCamera()
-
-# --- Serial Data Handling ---
 
 from ursina import *
 import serial
@@ -58,17 +41,83 @@ show_trail = True
 show_axes = True
 
 # Trail (ghost boards) to show recent orientations
-trail_length = 12
-trail = []  # list of Entities
-for i in range(trail_length):
-    g = Entity(model='cube', scale=(3, 0.4, 1.6), color=color.rgba(100, 100, 255, 15), visible=False)
-    trail.append(g)
+max_trail_capacity = 30
+trail_length = 12  # current visible length (can be changed at runtime)
+trail = []  # list of ghost Entities (max capacity)
+
+def create_ghost():
+    g = Entity(model='cube', scale=board.scale, color=color.rgba(150, 170, 255, 40), visible=False)
+    # pointer child
+    p = Entity(model='cube', parent=g, scale=(0.14, 0.25, 0.7), position=(0, 0, 0.85), color=color.rgba(255, 80, 80, 180))
+    # axes children
+    Entity(parent=g, model='cube', scale=(1.0, 0.03, 0.03), position=(0.5, 0.21, 0), color=color.rgba(255, 50, 50, 200))
+    Entity(parent=g, model='cube', scale=(0.03, 1.0, 0.03), position=(0.0, -0.5, 0), color=color.rgba(50, 255, 50, 200))
+    Entity(parent=g, model='cube', scale=(0.03, 0.03, 1.0), position=(0, 0.21, 0.5), color=color.rgba(50, 100, 255, 200))
+    return g
+
+for i in range(max_trail_capacity):
+    trail.append(create_ghost())
 
 # Simple bar meters for roll/pitch/yaw
 meter_roll = Entity(parent=camera.ui, model='quad', scale=(0.25, 0.02), position=Vec2(-0.6, 0.45), color=color.red)
 meter_pitch = Entity(parent=camera.ui, model='quad', scale=(0.25, 0.02), position=Vec2(-0.6, 0.40), color=color.green)
 meter_yaw = Entity(parent=camera.ui, model='quad', scale=(0.25, 0.02), position=Vec2(-0.6, 0.35), color=color.blue)
 meter_bg = Entity(parent=camera.ui, model='quad', scale=(0.26, 0.1), position=Vec2(-0.6, 0.38), color=color.rgba(255,255,255,8))
+
+# smoothing (defined early so labels can reference it)
+alpha = 0.25  # smoothing factor (0..1), higher = less smoothing
+
+# Control panel labels (updated in code when values change)
+alpha_label = Text(text=f'Smooth: {alpha:.2f}', parent=camera.ui, position=Vec2(0.48, 0.45), scale=0.7, color=color.white)
+trail_label = Text(text=f'Trail: {trail_length}', parent=camera.ui, position=Vec2(0.48, 0.38), scale=0.7, color=color.white)
+
+# calibration offsets
+offsets = [0.0, 0.0, 0.0]
+
+# sample data for playback (simple synthetic waveform)
+sample_data = [(math.sin(i/10)*40, math.sin(i/12)*30, math.sin(i/15)*90) for i in range(0, 720)]
+playback_mode = False
+playback_index = 0
+playback_timer = 0.0
+playback_rate = 60.0  # frames per second
+
+# --- Control callbacks and buttons ---
+def set_alpha(d):
+    global alpha
+    alpha = max(0.0, min(0.95, alpha + d))
+    alpha_label.text = f'Smooth: {alpha:.2f}'
+
+def set_trail(d):
+    global trail_length
+    trail_length = max(0, min(max_trail_capacity, trail_length + d))
+    trail_label.text = f'Trail: {trail_length}'
+
+def calibrate():
+    # set current smoothed_angles as zero offsets
+    global offsets
+    offsets = smoothed_angles.copy()
+    status_text.text = 'Calibrated'
+
+def toggle_playback():
+    global playback_mode, playback_index
+    playback_mode = not playback_mode
+    playback_index = 0
+    status_text.text = 'Playback on' if playback_mode else 'Playback off'
+
+# Buttons
+btn_alpha_minus = Button(text='- Smooth', parent=camera.ui, position=Vec2(0.40, 0.45), scale=0.06)
+btn_alpha_plus = Button(text='+ Smooth', parent=camera.ui, position=Vec2(0.56, 0.45), scale=0.06)
+btn_trail_minus = Button(text='- Trail', parent=camera.ui, position=Vec2(0.40, 0.38), scale=0.06)
+btn_trail_plus = Button(text='+ Trail', parent=camera.ui, position=Vec2(0.56, 0.38), scale=0.06)
+btn_cal = Button(text='Calibrate (C)', parent=camera.ui, position=Vec2(0.48, 0.31), scale=0.08)
+btn_play = Button(text='Playback (P)', parent=camera.ui, position=Vec2(0.48, 0.24), scale=0.08)
+
+btn_alpha_minus.on_click = lambda: set_alpha(-0.05)
+btn_alpha_plus.on_click = lambda: set_alpha(0.05)
+btn_trail_minus.on_click = lambda: set_trail(-1)
+btn_trail_plus.on_click = lambda: set_trail(1)
+btn_cal.on_click = calibrate
+btn_play.on_click = toggle_playback
 
 # --- Serial / Data Handling ---
 # Mutable shared state
@@ -186,6 +235,14 @@ def input(key):
         y_axis.visible = show_axes
         z_axis.visible = show_axes
         status_text.text = 'Axes: on' if show_axes else 'Axes: off'
+    if key == 'c':
+        calibrate()
+    if key == 'p':
+        toggle_playback()
+    if key == '+':
+        set_alpha(0.05)
+    if key == '-':
+        set_alpha(-0.05)
     if key == 'escape':
         application.quit()
 
