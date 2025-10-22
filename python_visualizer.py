@@ -30,7 +30,7 @@ z_axis = Entity(parent=board, model='cube', scale=(0.03, 0.03, 1.0), position=(0
 
 # Camera and environment tweaks
 EditorCamera()
-window.color = color.rgb(18, 26, 34)  # darker background
+window.color = color.black  # black background
 
 # Lighting
 DirectionalLight(y=2, z=3, shadows=False)
