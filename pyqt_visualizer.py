@@ -18,7 +18,12 @@ import threading
 import time
 from collections import deque
 
+import os
 import numpy as np
+
+# Reduce noisy Qt font warnings (must be set before importing Qt modules)
+os.environ.setdefault('QT_LOGGING_RULES', 'qt.qpa.fonts.warning=false;qt.qpa.fonts.info=false')
+
 from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
@@ -105,6 +110,18 @@ class PyQtVisualizer(QtWidgets.QWidget):
         # Buttons
         self.mock_btn = QtWidgets.QPushButton('Toggle Mock')
         self.calib_btn = QtWidgets.QPushButton('Calibrate')
+        # Serial port chooser
+        self.port_box = QtWidgets.QComboBox()
+        self.refresh_btn = QtWidgets.QPushButton('Refresh Ports')
+        self.connect_btn = QtWidgets.QPushButton('Connect')
+        self.disconnect_btn = QtWidgets.QPushButton('Disconnect')
+        right.addWidget(self.port_box)
+        right.addWidget(self.refresh_btn)
+        right.addWidget(self.connect_btn)
+        right.addWidget(self.disconnect_btn)
+        # Launcher button for Ursina visualizer
+        self.launch_ursina_btn = QtWidgets.QPushButton('Run Ursina visualizer')
+        right.addWidget(self.launch_ursina_btn)
         right.addWidget(self.mock_btn)
         right.addWidget(self.calib_btn)
 
@@ -126,6 +143,8 @@ class PyQtVisualizer(QtWidgets.QWidget):
         self.smoothed = [0.0,0.0,0.0]
         self.alpha = 0.25
         self.offsets = [0.0,0.0,0.0]
+        # quaternion for smooth rotation (w, x, y, z)
+        self.current_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
         # Serial
         self.serial_thread = None
@@ -137,6 +156,13 @@ class PyQtVisualizer(QtWidgets.QWidget):
         # connections
         self.mock_btn.clicked.connect(self.toggle_mock)
         self.calib_btn.clicked.connect(self.calibrate)
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        self.connect_btn.clicked.connect(self.ui_connect)
+        self.disconnect_btn.clicked.connect(self.ui_disconnect)
+        self.launch_ursina_btn.clicked.connect(self.launch_ursina)
+
+        # initial port list
+        self.refresh_ports()
 
         # Timer
         self.timer = QtCore.QTimer()
@@ -145,6 +171,48 @@ class PyQtVisualizer(QtWidgets.QWidget):
 
         # Mock generator timer
         self.mock_timer = 0.0
+
+    # --- Quaternion helpers for smooth rotation ---
+    def _quat_from_euler(self, roll, pitch, yaw):
+        # roll (x), pitch (y), yaw (z) in radians
+        cr = math.cos(roll/2)
+        sr = math.sin(roll/2)
+        cp = math.cos(pitch/2)
+        sp = math.sin(pitch/2)
+        cy = math.cos(yaw/2)
+        sy = math.sin(yaw/2)
+        # ZYX order
+        w = cy*cp*cr + sy*sp*sr
+        x = cy*cp*sr - sy*sp*cr
+        y = cy*sp*cr + sy*cp*sr
+        z = sy*cp*cr - cy*sp*sr
+        return np.array([w, x, y, z])
+
+    def _quat_slerp(self, q0, q1, t):
+        # Spherical linear interpolation
+        dot = np.dot(q0, q1)
+        if dot < 0.0:
+            q1 = -q1
+            dot = -dot
+        DOT_THRESHOLD = 0.9995
+        if dot > DOT_THRESHOLD:
+            # linear fallback
+            result = q0 + t*(q1 - q0)
+            return result/np.linalg.norm(result)
+        theta_0 = math.acos(dot)
+        theta = theta_0 * t
+        q2 = q1 - q0*dot
+        q2 = q2 / np.linalg.norm(q2)
+        return q0*math.cos(theta) + q2*math.sin(theta)
+
+    def _quat_to_matrix(self, q):
+        # convert quaternion to 3x3 rotation matrix
+        w,x,y,z = q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ])
 
     def _make_plane_mesh(self):
         # Create a simple low-poly airplane-like plane centered at origin
@@ -167,11 +235,16 @@ class PyQtVisualizer(QtWidgets.QWidget):
         self.serial_thread = SerialThread(port)
         self.serial_thread.line_received.connect(self.on_line)
         self.serial_thread.start()
+        self.port = port
+        self.connect_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(True)
 
     def stop_serial(self):
         if self.serial_thread:
             self.serial_thread.stop()
             self.serial_thread = None
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
 
     def on_line(self, line):
         parts = line.split(',')
@@ -186,6 +259,7 @@ class PyQtVisualizer(QtWidgets.QWidget):
         self.mock = not self.mock
         if self.mock:
             self.stop_serial()
+        self.mock_btn.setText('Toggle Mock (On)' if self.mock else 'Toggle Mock')
 
     def calibrate(self):
         self.offsets = self.smoothed.copy()
@@ -200,29 +274,44 @@ class PyQtVisualizer(QtWidgets.QWidget):
             self.smoothed[i] = self.alpha * self.latest[i] + (1-self.alpha) * self.smoothed[i]
             val = self.smoothed[i] - self.offsets[i]
 
-        # apply rotation to plane: note pyqtgraph GL uses right-handed coordinates
-        rx = np.deg2rad(self.smoothed[1])
-        ry = np.deg2rad(self.smoothed[0])
-        rz = np.deg2rad(self.smoothed[2])
-        # build rotation matrix (ZYX)
-        Rz = np.array([[math.cos(rz), -math.sin(rz), 0],[math.sin(rz), math.cos(rz),0],[0,0,1]])
-        Ry = np.array([[math.cos(ry),0,math.sin(ry)],[0,1,0],[-math.sin(ry),0,math.cos(ry)]])
-        Rx = np.array([[1,0,0],[0,math.cos(rx),-math.sin(rx)],[0,math.sin(rx),math.cos(rx)]])
-        R = Rz.dot(Ry).dot(Rx)
+        # apply rotation to plane using quaternion slerp for smoothness
+        roll_rad = math.radians(self.smoothed[0])
+        pitch_rad = math.radians(self.smoothed[1])
+        yaw_rad = math.radians(self.smoothed[2])
+        target_q = self._quat_from_euler(roll_rad, pitch_rad, yaw_rad)
+        # slerp factor (use alpha to control responsiveness)
+        slerp_t = max(0.02, 1.0 - self.alpha)
+        new_q = self._quat_slerp(self.current_quat, target_q, slerp_t)
+        new_q = new_q / np.linalg.norm(new_q)
+        self.current_quat = new_q
+        R = self._quat_to_matrix(self.current_quat)
         verts, faces = self._make_plane_mesh()
         verts = verts.dot(R.T)
+        # update mesh with rotated vertices
         self.plane.setMeshData(vertexes=verts, faces=faces)
 
         # update trail
         if not self.mock:
-            # append a translucent copy
             md = gl.MeshData(vertexes=verts.copy(), faces=faces)
-            item = gl.GLMeshItem(meshdata=md, smooth=True, color=(0.2,0.6,1,0.25))
+            alpha_val = 0.35
+            item = gl.GLMeshItem(meshdata=md, smooth=True, color=(0.2,0.6,1,alpha_val))
+            item.setGLOptions('translucent')
             self.view.addItem(item)
             self.trail.append(item)
-            if len(self.trail) > 40:
+            # fade trail items progressively
+            n = len(self.trail)
+            for idx, it in enumerate(self.trail):
+                frac = (idx+1)/n
+                try:
+                    it.opts['color'] = (0.2, 0.6, 1.0, alpha_val*(1-frac))
+                except Exception:
+                    pass
+            if len(self.trail) > self.trail.maxlen:
                 old = self.trail.popleft()
-                self.view.removeItem(old)
+                try:
+                    self.view.removeItem(old)
+                except Exception:
+                    pass
 
         # update readouts
         self.roll_label.setText(f'Roll: {self.smoothed[0]:.2f}')
@@ -232,6 +321,42 @@ class PyQtVisualizer(QtWidgets.QWidget):
         self.pitch_meter.setValue(int(self.smoothed[1]))
         self.yaw_meter.setValue(int(self.smoothed[2]))
 
+    def refresh_ports(self):
+        # List available serial ports
+        try:
+            from serial.tools import list_ports
+            ports = [p.device for p in list_ports.comports()]
+        except Exception:
+            ports = []
+        self.port_box.clear()
+        self.port_box.addItems(ports)
+
+    def ui_connect(self):
+        port = self.port_box.currentText()
+        if port:
+            self.mock = False
+            self.start_serial(port)
+
+    def ui_disconnect(self):
+        self.stop_serial()
+
+    def launch_ursina(self):
+        # Launch the existing python_visualizer.py as a subprocess
+        import subprocess
+        script = r"d:\Code\Arduino\ESP32\MPU6050 with GUI\python_visualizer.py"
+        args = [sys.executable, script]
+        if self.mock:
+            args.append('--mock')
+        else:
+            port = self.port_box.currentText()
+            if port:
+                args += ["--port", port]
+        try:
+            subprocess.Popen(args, creationflags=0)
+            QtWidgets.QMessageBox.information(self, 'Launched', 'Ursina visualizer launched.')
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Error', f'Failed to launch: {e}')
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -240,6 +365,11 @@ def main():
     args = parser.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
+    # Set a safe default system font to avoid missing-font warnings
+    try:
+        app.setFont(QtGui.QFont("Segoe UI", 9))
+    except Exception:
+        pass
     w = PyQtVisualizer(port=args.port, mock=args.mock)
     w.show()
     sys.exit(app.exec_())
