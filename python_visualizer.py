@@ -17,20 +17,28 @@ args = parser.parse_args()
 # --- Ursina App Setup ---
 app = Ursina()
 
-# Define the 3D model for our sensor - a flattened box
-board = Entity(model='cube', scale=(3, 0.4, 1.6), color=color.azure, texture=None)
 
-# Add a bigger red pointer to show the "front" direction
+# --- Airplane-like board shape ---
+board = Entity(model=None, color=color.azure, texture=None)
+# Main body (fuselage)
+body = Entity(model='cube', parent=board, scale=(2.2, 0.18, 0.5), color=color.azure, position=(0, 0, 0))
+# Wings
+left_wing = Entity(model='cube', parent=board, scale=(0.7, 0.05, 1.6), color=color.rgba(80, 180, 255, 220), position=(-0.7, 0, 0))
+right_wing = Entity(model='cube', parent=board, scale=(0.7, 0.05, 1.6), color=color.rgba(80, 180, 255, 220), position=(0.7, 0, 0))
+# Tail (vertical stabilizer)
+tail = Entity(model='cube', parent=board, scale=(0.25, 0.18, 0.4), color=color.rgba(255, 220, 80, 220), position=(0, 0.13, -0.7))
+# Nose pointer
 pointer = Entity(model='cube', parent=board, scale=(0.14, 0.25, 0.7), position=(0, 0, 0.85), color=color.red)
-
-# Add three colored axis markers attached to the board to make orientation clearer
+# Axis markers
 x_axis = Entity(parent=board, model='cube', scale=(1.0, 0.03, 0.03), position=(0.5, 0.21, 0), color=color.red)
 y_axis = Entity(parent=board, model='cube', scale=(0.03, 1.0, 0.03), position=(0.0, -0.5, 0), color=color.green)
 z_axis = Entity(parent=board, model='cube', scale=(0.03, 0.03, 1.0), position=(0, 0.21, 0.5), color=color.blue)
 
 # Camera and environment tweaks
+
 EditorCamera()
 window.color = color.black  # black background
+window.icon = r"D:\Code\Arduino\ESP32\MPU6050 with GUI\planeicon.ico"  # set custom icon
 
 # Lighting
 DirectionalLight(y=2, z=3, shadows=False)
